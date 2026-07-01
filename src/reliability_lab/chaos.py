@@ -49,52 +49,62 @@ def build_gateway(config: LabConfig, provider_overrides: dict[str, float] | None
 
 
 def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
-    """Derive recovery time from circuit breaker transition logs.
-
-    TODO(student): Implement recovery time calculation:
-    1. For each breaker in gateway.breakers.values():
-       - Walk breaker.transition_log entries
-       - Track when circuit goes to "open" (save ts)
-       - Track when circuit goes to "closed" (compute delta from open ts)
-       - Recovery time = (close_ts - open_ts) * 1000 (convert to ms)
-    2. Return average of all recovery times, or None if no recovery occurred.
-
-    Each transition_log entry is a dict with keys: "from", "to", "reason", "ts"
-    where "ts" is time.time() (epoch seconds).
-    """
-    raise NotImplementedError("TODO: implement calculate_recovery_time_ms()")
+    """Derive recovery time from circuit breaker transition logs."""
+    recovery_times = []
+    for breaker in gateway.breakers.values():
+        open_ts = None
+        for entry in breaker.transition_log:
+            if entry["to"] == "open" and open_ts is None:
+                open_ts = float(entry["ts"])
+            elif entry["to"] == "closed" and open_ts is not None:
+                recovery_times.append((float(entry["ts"]) - open_ts) * 1000)
+                open_ts = None
+    if not recovery_times:
+        return None
+    return sum(recovery_times) / len(recovery_times)
 
 
 def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
-    """Run a single named chaos scenario.
+    """Run a single named chaos scenario."""
+    gateway = build_gateway(config, scenario.provider_overrides or None)
+    metrics = RunMetrics()
+    for _ in range(config.load_test.requests):
+        query = random.choice(queries)
+        result = gateway.complete(query)
+        metrics.total_requests += 1
+        metrics.estimated_cost += result.estimated_cost
+        
+        if result.cache_hit:
+            metrics.cache_hits += 1
+            metrics.estimated_cost_saved += 0.001
+            
+        if result.route == "fallback":
+            metrics.fallback_successes += 1
+            metrics.successful_requests += 1
+        elif result.route == "static_fallback":
+            metrics.static_fallbacks += 1
+            metrics.failed_requests += 1
+        else:
+            metrics.successful_requests += 1
+            
+        if result.latency_ms > 0:
+            metrics.latencies_ms.append(result.latency_ms)
 
-    TODO(student): Implement the scenario runner:
-    1. Build gateway with build_gateway(config, scenario.provider_overrides or None)
-    2. Create empty RunMetrics()
-    3. Loop config.load_test.requests times:
-       a. Pick random query from queries
-       b. Call gateway.complete(prompt)
-       c. Update metrics:
-          - total_requests += 1
-          - estimated_cost += result.estimated_cost
-          - If cache_hit: cache_hits += 1, estimated_cost_saved += 0.001
-          - If route == "fallback": fallback_successes += 1, successful_requests += 1
-          - If route == "static_fallback": static_fallbacks += 1, failed_requests += 1
-          - Else: successful_requests += 1
-          - If result.latency_ms > 0: append to latencies_ms
-    4. Count circuit_open_count from breaker transition logs (entries where to == "open")
-    5. Set recovery_time_ms via calculate_recovery_time_ms(gateway)
-    6. Return metrics
-    """
-    raise NotImplementedError("TODO: implement run_scenario()")
+    # Count circuit_open_count from breaker transition logs (entries where to == "open")
+    circuit_open_count = 0
+    for breaker in gateway.breakers.values():
+        for entry in breaker.transition_log:
+            if entry["to"] == "open":
+                circuit_open_count += 1
+    metrics.circuit_open_count = circuit_open_count
+
+    # Set recovery_time_ms via calculate_recovery_time_ms(gateway)
+    metrics.recovery_time_ms = calculate_recovery_time_ms(gateway)
+    return metrics
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
-    """Run all named scenarios from config, or a default run if none defined.
-
-    TODO(student): Add a cache vs no-cache comparison scenario.
-    Extend with your own custom scenarios (e.g., cost cap near limit).
-    """
+    """Run all named scenarios from config, or a default run if none defined."""
     if not config.scenarios:
         default_scenario = ScenarioConfig(name="default", description="baseline run")
         metrics = run_scenario(config, queries, default_scenario)
@@ -105,9 +115,15 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
     for scenario in config.scenarios:
         result = run_scenario(config, queries, scenario)
 
-        # TODO(student): Define pass/fail criteria per scenario.
-        # Example: primary_timeout_100 passes if fallback_success_rate > 0.9
-        passed = result.successful_requests > 0
+        # Define pass/fail criteria per scenario.
+        if scenario.name == "primary_timeout_100":
+            passed = result.fallback_success_rate > 0.9 and result.availability > 0.9
+        elif scenario.name == "primary_flaky_50":
+            passed = result.circuit_open_count > 0 and result.availability > 0.5
+        elif scenario.name == "all_healthy":
+            passed = result.availability > 0.95 and result.failed_requests == 0
+        else:
+            passed = result.successful_requests > 0
         combined.scenarios[scenario.name] = "pass" if passed else "fail"
 
         combined.total_requests += result.total_requests
@@ -125,5 +141,31 @@ def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:
                 combined.recovery_time_ms = result.recovery_time_ms
             else:
                 combined.recovery_time_ms = (combined.recovery_time_ms + result.recovery_time_ms) / 2
+
+    # Run cache vs no-cache comparison scenario and write metrics
+    import copy
+    no_cache_config = copy.deepcopy(config)
+    no_cache_config.cache.enabled = False
+    
+    # Run flaky scenario with and without cache
+    flaky_scenario = next((s for s in config.scenarios if s.name == "primary_flaky_50"), config.scenarios[0])
+    no_cache_result = run_scenario(no_cache_config, queries, flaky_scenario)
+    no_cache_result.write_json("reports/metrics_no_cache.json")
+    
+    cache_result = run_scenario(config, queries, flaky_scenario)
+    cache_result.write_json("reports/metrics_cache.json")
+    
+    # If combined recovery time is None, try to get it from comparison runs
+    if combined.recovery_time_ms is None:
+        if no_cache_result.recovery_time_ms is not None:
+            combined.recovery_time_ms = no_cache_result.recovery_time_ms
+        elif cache_result.recovery_time_ms is not None:
+            combined.recovery_time_ms = cache_result.recovery_time_ms
+
+    print("\n=======================================================")
+    print("CACHE COMPARISON SIMULATION COMPLETED")
+    print("Metrics with cache written to: reports/metrics_cache.json")
+    print("Metrics without cache written to: reports/metrics_no_cache.json")
+    print("=======================================================\n")
 
     return combined
